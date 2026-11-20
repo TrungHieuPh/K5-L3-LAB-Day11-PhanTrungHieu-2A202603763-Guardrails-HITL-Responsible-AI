@@ -27,6 +27,31 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+def _protected_secret_pattern() -> str | None:
+    """Regex khớp nguyên văn các secret demo trong data/protected/ (admin123, ...)."""
+    try:
+        from core.config import DEMO_SECRETS
+    except ImportError:
+        return None
+    secrets = sorted((s for s in DEMO_SECRETS if s), key=len, reverse=True)
+    return "|".join(re.escape(s) for s in secrets) or None
+
+
+# Module-level để lớp khác (egress ở Checkpoint 3) dùng lại cùng định nghĩa.
+SENSITIVE_PATTERNS = {
+    "phone": r"\b0\d{9,10}\b",
+    "email": r"\b[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+    "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+    "api_key": r"\bsk-[a-zA-Z0-9_-]+\b",
+    "password": r"\bpassword\b\s*(?::|=|\bis\b)\s*\S+",
+    # Host nội bộ, ví dụ db.vinbank.internal:5432
+    "db_host": r"\b[\w-]+(?:\.[\w-]+)*\.(?:internal|local)(?::\d+)?\b",
+}
+_secret_pattern = _protected_secret_pattern()
+if _secret_pattern:
+    SENSITIVE_PATTERNS["protected_secret"] = _secret_pattern
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -39,18 +64,9 @@ def content_filter(response: str) -> dict:
     issues = []
     redacted = response
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in SENSITIVE_PATTERNS.items():
+        # Tìm trên bản đã che dần → không đếm lại thứ pattern trước đã che.
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -172,16 +188,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            response_text = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text="I cannot provide that response. Please ask about your banking needs."
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
